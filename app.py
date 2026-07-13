@@ -1733,7 +1733,6 @@ def fetch_batch_data(tickers: List[str]) -> List[Dict]:
         fetched = executor.map(fetch_robust_data, clean_tickers)
         return [data for data in fetched if data]
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def get_industry_average_scores(_progress_placeholder=None):
     industry_scores = []
     total_industries = sum(len(industries) for industries in SECTOR_INDUSTRY_MAP_EN.values())
