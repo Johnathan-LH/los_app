@@ -3,7 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Dict, Optional
 import io
@@ -22,6 +22,7 @@ from bs4 import BeautifulSoup
 # Keep outbound traffic bounded. Four workers materially reduces waiting time while
 # avoiding the request bursts caused by unbounded concurrency on free hosting.
 MAX_FETCH_WORKERS = max(1, min(int(os.getenv("GKHAW_FETCH_WORKERS", "4")), 8))
+MAX_RANKING_WORKERS = max(1, min(int(os.getenv("GKHAW_RANKING_WORKERS", "8")), 12))
 
 # 设置 matplotlib 字体
 plt.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans']
@@ -31,7 +32,7 @@ plt.rcParams['axes.unicode_minus'] = False
 st.set_page_config(
     page_title="專業美股診斷終端 - 專業版", 
     layout="wide", 
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="auto"
 )
 
 # ==========================================
@@ -219,6 +220,128 @@ st.markdown("""
     }
     .stButton button {
         margin-bottom: 5px !important;
+    }
+
+    /* Mobile: let Streamlit collapse the control panel and stack every data row. */
+    @media (max-width: 768px) {
+        .stAppViewContainer,
+        .stMain,
+        main {
+            max-width: 100vw !important;
+            overflow-x: hidden !important;
+        }
+
+        .block-container {
+            padding: 0.75rem 0.7rem 2.5rem !important;
+            max-width: 100% !important;
+        }
+
+        section[data-testid="stSidebar"] {
+            min-width: min(85vw, 300px) !important;
+            width: min(85vw, 300px) !important;
+            max-width: min(85vw, 300px) !important;
+        }
+
+        section[data-testid="stSidebar"] > div {
+            padding-left: 0.65rem !important;
+            padding-right: 0.65rem !important;
+        }
+
+        button[kind="header"],
+        button[data-testid="stBaseButton-header"] {
+            display: inline-flex !important;
+        }
+
+        div[data-testid="stHorizontalBlock"] {
+            flex-direction: column !important;
+            gap: 0.75rem !important;
+        }
+
+        div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+            width: 100% !important;
+            min-width: 100% !important;
+            flex: 1 1 100% !important;
+        }
+
+        .right-top-logo {
+            padding: 10px 12px !important;
+            margin-bottom: 12px !important;
+            gap: 10px !important;
+            border-radius: 9px !important;
+        }
+
+        .right-logo-img {
+            width: 36px !important;
+            height: 36px !important;
+            flex: 0 0 36px !important;
+        }
+
+        .right-logo-title {
+            font-size: clamp(18px, 5.5vw, 24px) !important;
+            line-height: 1.15 !important;
+            text-wrap: balance;
+        }
+
+        .right-logo-sub {
+            font-size: 12px !important;
+            line-height: 1.25 !important;
+        }
+
+        .main-header,
+        .section-header-a,
+        .section-header-b,
+        .section-header-c,
+        .report-header-a,
+        .peer-header-b {
+            font-size: 20px !important;
+            line-height: 1.2 !important;
+            padding: 8px 10px !important;
+            border-radius: 8px !important;
+        }
+
+        .main-header-sub,
+        .section-header-a-sub,
+        .section-header-b-sub,
+        .section-header-c-sub,
+        .report-header-sub,
+        .peer-header-sub {
+            font-size: 13px !important;
+            line-height: 1.25 !important;
+        }
+
+        .big-score {
+            font-size: 58px !important;
+            overflow-wrap: anywhere;
+        }
+
+        .big-score span {
+            font-size: 28px !important;
+        }
+
+        .score-label {
+            font-size: 16px !important;
+        }
+
+        div[data-testid="stDataFrame"],
+        div[data-testid="stTable"] {
+            max-width: 100% !important;
+            overflow-x: auto !important;
+        }
+
+        div[data-testid="stImage"] img {
+            max-width: 100% !important;
+            height: auto !important;
+        }
+
+        .stCaptionContainer,
+        div[data-testid="stCaptionContainer"] {
+            overflow-wrap: anywhere !important;
+        }
+
+        h1 { font-size: 1.65rem !important; }
+        h2 { font-size: 1.4rem !important; }
+        h3 { font-size: 1.2rem !important; }
+        h5 { font-size: 1rem !important; }
     }
     </style>
 """, unsafe_allow_html=True)
@@ -1734,30 +1857,70 @@ def fetch_batch_data(tickers: List[str]) -> List[Dict]:
         return [data for data in fetched if data]
 
 def get_industry_average_scores(_progress_placeholder=None):
+    # Build one unique stock universe, fetch it with a single bounded executor,
+    # then aggregate the unchanged stock scores back into all 80 industries.
+    # This preserves every formula and result field while removing the old
+    # industry-by-industry serial bottleneck.
     industry_scores = []
-    total_industries = sum(len(industries) for industries in SECTOR_INDUSTRY_MAP_EN.values())
-    processed = 0
+    industry_universe = []
+    unique_tickers = []
+    seen_tickers = set()
+
     for sector_en, industries in SECTOR_INDUSTRY_MAP_EN.items():
         for industry in industries:
-            processed += 1
-            if _progress_placeholder is not None:
-                _progress_placeholder.progress(processed / total_industries, 
-                                               text=f"正在分析 {industry} ({processed}/{total_industries})")
             stocks = get_industry_stocks(industry)
-            if stocks:
+            industry_universe.append((sector_en, industry, stocks))
+            for ticker in stocks:
+                if ticker not in seen_tickers:
+                    seen_tickers.add(ticker)
+                    unique_tickers.append(ticker)
+
+    ticker_data = {}
+    total_tickers = len(unique_tickers)
+    if total_tickers:
+        workers = min(MAX_RANKING_WORKERS, total_tickers)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_ticker = {
+                executor.submit(fetch_robust_data, ticker): ticker
+                for ticker in unique_tickers
+            }
+            completed = 0
+            for future in as_completed(future_to_ticker):
+                ticker = future_to_ticker[future]
                 try:
-                    data_list = fetch_batch_data(stocks)
-                    if data_list:
-                        avg_score = sum(d['綜合分數'] for d in data_list) / len(data_list)
-                        industry_scores.append({
-                            "sector": sector_en,
-                            "industry": industry,
-                            "avg_score": avg_score,
-                            "stock_count": len(data_list)
-                        })
+                    data = future.result()
+                    if data:
+                        ticker_data[ticker] = data
                 except Exception as e:
-                    print(f"Error processing {industry}: {e}")
-            time.sleep(0.05)
+                    print(f"Error processing {ticker}: {e}")
+                completed += 1
+                if _progress_placeholder is not None and (
+                    completed == 1 or completed % 3 == 0 or completed == total_tickers
+                ):
+                    _progress_placeholder.progress(
+                        0.9 * completed / total_tickers,
+                        text=f"正在分析股票 ({completed}/{total_tickers})"
+                    )
+
+    total_industries = len(industry_universe)
+    for processed, (sector_en, industry, stocks) in enumerate(industry_universe, start=1):
+        data_list = [ticker_data[ticker] for ticker in stocks if ticker in ticker_data]
+        if data_list:
+            avg_score = sum(d['綜合分數'] for d in data_list) / len(data_list)
+            industry_scores.append({
+                "sector": sector_en,
+                "industry": industry,
+                "avg_score": avg_score,
+                "stock_count": len(data_list)
+            })
+        if _progress_placeholder is not None and (
+            processed == total_industries or processed % 8 == 0
+        ):
+            _progress_placeholder.progress(
+                0.9 + 0.1 * processed / total_industries,
+                text=f"正在整理行業排名 ({processed}/{total_industries})"
+            )
+
     industry_scores.sort(key=lambda x: x["avg_score"], reverse=True)
     return industry_scores
 
@@ -1984,7 +2147,7 @@ with st.sidebar:
             st.cache_data.clear()
             st.rerun()
     elif not loading:
-        st.info("💡 點擊上方按鈕載入行業排名數據（首次載入約需2-3分鐘，之後會快取2小時）")
+        st.info("💡 點擊上方按鈕載入完整行業排名。首次速度取決於 Yahoo Finance；完成後本次工作階段可直接重用，底層股票資料快取 1 小時。")
 
 # ==========================================
 # 12. 右侧主区域（根据模式显示内容，保留原有标题）

@@ -11,3 +11,5 @@ services:
         value: 3.12.11
       - key: GKHAW_FETCH_WORKERS
         value: 4
+      - key: GKHAW_RANKING_WORKERS
+        value: 8
